@@ -1,0 +1,33 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# === PyInstaller ===
+build/
+dist/
+*.spec.bak
+
+# === PyEnv / VirtualEnv ===
+venv/
+.venv/
+env/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# === 项目运行期产物 ===
+_app_output.log
+*.fsmproj
+!assets/
+
+# === 临时截图 / 调试 ===
+_*.png
+_*.log
+_*.json
