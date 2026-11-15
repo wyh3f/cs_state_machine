@@ -2547,8 +2547,8 @@ class StateCanvas(tk.Canvas):
         self._refresh_node_actions(nid)
         self._notify()
 
-    def set_state_actions_enabled(self, nid, enabled):
-        """开关状态内部动作：关闭时清空进入/退出/执行，开关状态随对象保存"""
+    def set_state_actions_enabled(self, nid, enabled, kinds=None):
+        """开关状态内部动作：关闭时清空指定动作（默认进入/退出/执行），开关状态随对象保存"""
         n = self.nodes.get(nid)
         if not n:
             return
@@ -2558,7 +2558,14 @@ class StateCanvas(tk.Canvas):
         self._push_undo()
         n["actions_on"] = enabled
         if not enabled:
-            n["actions"] = {k: "" for k in self.STATE_ACTION_KINDS}
+            if kinds is None:
+                n["actions"] = {k: "" for k in self.STATE_ACTION_KINDS}
+            else:
+                actions = n.setdefault(
+                    "actions", {k: "" for k in self.STATE_ACTION_KINDS})
+                for k in kinds:
+                    if k in actions:
+                        actions[k] = ""
         self._refresh_node_actions(nid)
         self._notify()
 

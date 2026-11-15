@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from canvas_widget import StateCanvas
+from generator import generate_lite
 
 
 class HoverTooltip:
@@ -598,6 +599,82 @@ class StatePalette(tk.Frame):
             self.canvas.add_state_at(x, y)
 
 
+class CodePreview(ctk.CTkToplevel):
+    """代码生成结果预览：文件切换 + 只读文本 + 复制 + 另存为"""
+
+    def __init__(self, master, result):
+        super().__init__(master)
+        self.result = result
+        self.title("生成代码预览")
+        self.geometry("860x680")
+        self.transient(master)
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(10, 6))
+        self.file_menu = ctk.CTkOptionMenu(
+            top, values=[f.name for f in result.files], width=240,
+            command=self._show_file,
+        )
+        self.file_menu.pack(side="left")
+        ctk.CTkButton(
+            top, text="复制", width=80, command=self._copy,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            top, text="另存为", width=90, command=self._save,
+        ).pack(side="right")
+
+        self.text = ctk.CTkTextbox(self, font=ctk.CTkFont(
+            family="Consolas", size=12), wrap="none")
+        self.text.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+        if result.warnings:
+            warn = ctk.CTkLabel(
+                self, anchor="w", justify="left", wraplength=820,
+                text_color="#b26a00",
+                text=" · ".join(w.message for w in result.warnings),
+            )
+            warn.pack(fill="x", padx=12, pady=(0, 8))
+
+        self._show_file(result.files[0].name)
+        self.after(120, self.text.focus_set)
+
+    def _current(self):
+        name = self.file_menu.get()
+        for item in self.result.files:
+            if item.name == name:
+                return item
+        return self.result.files[0]
+
+    def _show_file(self, _name=None):
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", self._current().content)
+        self.text.configure(state="disabled")
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._current().content)
+        self.configure(title="生成代码预览 - 已复制到剪贴板")
+
+    def _save(self):
+        item = self._current()
+        path = filedialog.asksaveasfilename(
+            parent=self, title="保存代码文件", initialfile=item.name,
+            defaultextension=".c" if item.name.endswith(".c") else ".h",
+            filetypes=[("C 源文件", "*.c"), ("C 头文件", "*.h"),
+                       ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(item.content)
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"无法写入文件：\n{exc}", parent=self)
+            return
+        self.configure(title=f"生成代码预览 - 已保存 {os.path.basename(path)}")
+
+
 class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -699,7 +776,11 @@ class MainWindow(ctk.CTk):
         if not self._loading and (doc["arch"], doc["level"]) != (
                 self._last_style or (None, None)):
             self._mark_active_modified()
+        prev_level = self._last_style[1] if self._last_style else None
         self._last_style = (doc["arch"], doc["level"])
+        # level 变化时按新模板重建右面板（arch 变化不重建）
+        if prev_level is not None and prev_level != doc["level"]:
+            self._apply_level_mode()
 
     # ── 顶部工具栏 ──────────────────────────────────────────
     def _build_toolbar(self):
@@ -960,7 +1041,39 @@ class MainWindow(ctk.CTk):
         card.pack(fill="x", padx=10, pady=(10, 0))
         return card
 
-    def _build_property_panel(self):
+    def _build_property_panel(self, level=None):
+        """按 level 分发到对应的模板构建函数；完整版与极简版是两套独立模板"""
+        if level is None:
+            level = self.level_var.get()
+        if level == "完整版":
+            self._build_property_panel_full()
+        else:
+            self._build_property_panel_lite()
+
+    def _apply_level_mode(self):
+        """极简版/完整版切换：销毁右面板全部子控件，按新 level 用对应模板重建"""
+        level = self.level_var.get()
+        # 重建前保存工程名（project_entry 是新建的，需要回填）
+        doc = self._active_doc() if getattr(self, "docs", None) else None
+        project_name = doc["project_name"] if doc else "untitled"
+        try:
+            for child in self.right_panel.winfo_children():
+                child.destroy()
+        except Exception:
+            pass
+        self._build_property_panel(level=level)
+        try:
+            if hasattr(self, "project_entry"):
+                self.project_entry.delete(0, "end")
+                self.project_entry.insert(0, project_name)
+            self._refresh_property_table()
+            self._refresh_event_table()
+            self._refresh_status_counts()
+        except Exception:
+            pass
+
+    def _build_property_panel_full(self):
+        """完整版模板：保留所有高级特性"""
         # 卡片一：属性面板（守卫开关在这里）
         prop_card = self._card()
         self._section_title(prop_card, "属性面板")
@@ -1056,7 +1169,7 @@ class MainWindow(ctk.CTk):
         # 卡片三：标签表
         table_card = self._card()
         self._section_title(table_card, "标签表")
-        self._build_table(table_card)
+        self._build_table_full(table_card)
 
         # 卡片四：事件表（独立滚动，只列唯一事件）
         event_card = self._card()
@@ -1074,9 +1187,120 @@ class MainWindow(ctk.CTk):
         self.event_rows_box.pack(fill="x", padx=4, pady=(0, 8))
         ctk.CTkFrame(event_card, height=4, fg_color="transparent").pack()
 
+    def _build_property_panel_lite(self):
+        """极简版模板：当前与完整版相同，后续在此模板上做精简（不影响完整版）"""
+        # 卡片一：属性面板（守卫开关在这里）
+        prop_card = self._card()
+        self._section_title(prop_card, "属性面板")
+
+        self.guard_hint = ctk.CTkLabel(
+            prop_card,
+            text="（选中状态可设置内部动作，选中转移可设置守卫和动作）",
+            text_color="gray", anchor="w", justify="left", wraplength=236,
+        )
+        self.guard_hint.pack(fill="x", padx=14, pady=(0, 12))
+
+        self.guard_switch_row = ctk.CTkFrame(prop_card, fg_color="transparent")
+        ctk.CTkLabel(
+            self.guard_switch_row, text="守卫", width=56, anchor="w",
+        ).pack(side="left")
+        self.guard_switch_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            self.guard_switch_row, text="", variable=self.guard_switch_var,
+            width=46, command=self._on_guard_toggle,
+        ).pack(side="left")
+        HelpIcon(
+            self.guard_switch_row,
+            "开启后可填写守卫条件；条件成立时转移才允许发生。关闭会清空条件。",
+        ).pack(side="left", padx=(5, 0))
+
+        self.action_switch_row = ctk.CTkFrame(prop_card, fg_color="transparent")
+        ctk.CTkLabel(
+            self.action_switch_row, text="动作", width=56, anchor="w",
+        ).pack(side="left")
+        self.action_switch_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            self.action_switch_row, text="", variable=self.action_switch_var,
+            width=46, command=self._on_action_toggle,
+        ).pack(side="left")
+        HelpIcon(
+            self.action_switch_row,
+            "开启后可填写转移动作；转移发生时执行。关闭会清空动作。",
+        ).pack(side="left", padx=(5, 0))
+
+        # 状态执行动作（极简版只有「执行」一项），仅在选中单个状态时出现
+        self.state_action_switch_row = ctk.CTkFrame(
+            prop_card, fg_color="transparent")
+        ctk.CTkLabel(
+            self.state_action_switch_row, text="状态动作", width=64, anchor="w",
+        ).pack(side="left")
+        self.state_action_switch_var = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            self.state_action_switch_row, text="",
+            variable=self.state_action_switch_var,
+            width=46, command=self._on_state_action_toggle,
+        ).pack(side="left")
+        HelpIcon(
+            self.state_action_switch_row,
+            "开启后可编辑状态执行动作；关闭会清空该动作。",
+        ).pack(side="left", padx=(5, 0))
+
+        # 卡片二：工程信息（静态展示）
+        info_card = self._card()
+        self._section_title(info_card, "工程信息")
+
+        info = [
+            ("工程名称", "untitled"),
+            ("状态数量", ""),
+            ("转移数量", ""),
+            ("模式", self._style_text()),
+        ]
+        for k, v in info:
+            row = ctk.CTkFrame(info_card, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=2)
+            ctk.CTkLabel(row, text=k, width=80, anchor="w").pack(side="left")
+            if k == "工程名称":
+                # 工程名称可编辑
+                self.project_entry = ctk.CTkEntry(row, height=26)
+                self.project_entry.insert(0, v)
+                self.project_entry.pack(
+                    side="left", fill="x", expand=True, padx=(8, 0))
+                self.project_entry.bind(
+                    "<KeyRelease>", self._on_project_name_changed)
+                HelpIcon(
+                    row, "当前工程名称，用于标识工程以及后续保存和生成代码。",
+                ).pack(side="left", padx=(5, 0))
+                continue
+            value_label = ctk.CTkLabel(row, text=v, anchor="w")
+            value_label.pack(side="left", padx=(8, 0))
+            if k == "状态数量":
+                self.node_count_label = value_label
+            elif k == "转移数量":
+                self.trans_count_label = value_label
+            elif k == "模式":
+                self.style_value_label = value_label
+        ctk.CTkFrame(info_card, height=10, fg_color="transparent").pack()
+
+        # 卡片三：标签表
+        table_card = self._card()
+        self._section_title(table_card, "标签表")
+        self._build_table_lite(table_card)
+
+        # 卡片四：事件表（独立滚动，只列唯一事件）
+        event_card = self._card()
+        self._section_title(event_card, "事件表")
+        self._event_hint = ctk.CTkLabel(
+            event_card, text="暂无事件", text_color="gray", anchor="w")
+        self._event_hint.pack(fill="x", padx=14, pady=(0, 8))
+        self.event_rows = {}
+        self.event_rows_box = ctk.CTkScrollableFrame(
+            event_card, height=110, fg_color="transparent")
+        self.event_rows_box.pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkFrame(event_card, height=4, fg_color="transparent").pack()
+
     # ── 标签表 ───────────────────────────────────────────────
-    def _build_table(self, parent):
-        """预先建好控件，切换选中时只更新内容，避免每次销毁重建造成闪烁"""
+    def _build_table_full(self, parent):
+        """完整版标签表模板：预先建好控件，切换选中时只更新内容，避免每次销毁重建造成闪烁"""
         self._table_obj = (None, None)
         self._edit_key = None   # 当前编辑会话，用于合并撤销点
 
@@ -1215,6 +1439,108 @@ class MainWindow(ctk.CTk):
         ctk.CTkFrame(parent, height=10, fg_color="transparent").pack()
         self._refresh_property_table()
 
+    def _build_table_lite(self, parent):
+        """极简版标签表模板：当前与完整版相同，后续在此模板上做精简（不影响完整版）"""
+        self._table_obj = (None, None)
+        self._edit_key = None   # 当前编辑会话，用于合并撤销点
+
+        self.table_hint = ctk.CTkLabel(
+            parent, text="未选中任何对象", text_color="gray", anchor="w",
+        )
+
+        self.state_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.name_entry = self._row_entry(
+            self.state_frame, "名称",
+            "状态的唯一名称；不能为空，也不能与其他状态重名。",
+        )
+        self.init_menu = self._row_menu(
+            self.state_frame, "初始", ["否", "是"], self._commit_initial,
+            "指定状态机启动时进入的初始状态；一个工程只能有一个初始状态。",
+        )
+        self.final_menu = self._row_menu(
+            self.state_frame, "最终", ["否", "是"], self._commit_final,
+            "将状态标记为最终状态；到达后表示状态机执行结束。一个工程最多一个最终状态。",
+        )
+        self.in_label = self._row_text(self.state_frame, "入边")
+        self.out_label = self._row_text(self.state_frame, "出边")
+        # 极简版不渲染父状态行，置空避免沿用上一模板的已销毁控件
+        self.parent_label = None
+
+        # 状态执行动作（极简版只保留「执行」）：开关在属性面板，多行可折叠
+        self.state_action_box = ctk.CTkFrame(
+            self.state_frame, fg_color="transparent")
+        self.state_action_entries = {}
+        box = CollapsibleInput(
+            self.state_action_box, "执行", height=68,
+            help_text="处于该状态期间执行的活动，可填写周期性或持续执行逻辑。",
+        )
+        box.pack(fill="x", padx=14, pady=3)
+        box.textbox.bind(
+            "<KeyRelease>", lambda e: self._live_state_action("do"))
+        box.textbox.bind(
+            "<FocusOut>", lambda e: self._flush_state_action("do"))
+        box.textbox.bind(
+            "<Control-Return>",
+            lambda e: self._commit_state_action_ctrl("do"))
+        self.state_action_entries["do"] = box
+
+        # 极简版不渲染内部转移，置空避免沿用上一模板的已销毁控件
+        self.internal_header = None
+        self.internal_box = None
+        self.internal_rows = []
+        self._internal_nid = None
+
+        self.trans_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.event_entry = self._row_entry(
+            self.trans_frame, "事件名",
+            "触发该转移的事件名称。自动转移不需要事件名。",
+        )
+        self.from_label = self._row_text(self.trans_frame, "起点")
+        self.to_label = self._row_text(self.trans_frame, "终点")
+        self.style_menu = self._row_menu(
+            self.trans_frame, "走线", ["直线", "曲线"], self._commit_style,
+            "选择连线的显示方式：直线或曲线；不影响状态机运行逻辑。",
+        )
+        # 极简版不渲染触发方式与优先级，置空避免沿用上一模板的已销毁控件
+        self.trigger_menu = None
+        self.priority_entry = None
+
+        # 条件输入（开关在属性面板，开启后才显示；多行可折叠）
+        self.guard_row = CollapsibleInput(
+            self.trans_frame, "守卫条件", height=76,
+            help_text="转移发生前必须满足的条件，例如 count > 0。可输入多行，留空表示不限制。",
+        )
+        self.guard_row.textbox.bind("<KeyRelease>", lambda e: self._live_guard())
+        self.guard_row.textbox.bind("<FocusOut>", lambda e: self._flush_guard())
+        self.guard_row.textbox.bind(
+            "<Control-Return>", lambda e: self._commit_guard_ctrl())
+
+        # 转移动作：事件触发时执行（UML：event [guard] / action）
+        self.action_row = CollapsibleInput(
+            self.trans_frame, "守卫动作", height=76,
+            help_text="转移实际发生时执行的动作，例如 motor_stop()。它属于转移，不是状态的进入或退出动作。",
+        )
+        self.action_row.textbox.bind("<KeyRelease>", lambda e: self._live_action())
+        self.action_row.textbox.bind("<FocusOut>", lambda e: self._flush_action())
+        self.action_row.textbox.bind(
+            "<Control-Return>", lambda e: self._commit_action_ctrl())
+
+        for entry, handler in (
+            (self.name_entry, self._commit_name),
+            (self.event_entry, self._commit_event),
+        ):
+            entry.bind(
+                "<Return>",
+                lambda e, en=entry, h=handler: self._commit_entry(en, h),
+            )
+            entry.bind(
+                "<FocusOut>",
+                lambda e, en=entry, h=handler: self._commit_entry(en, h),
+            )
+
+        ctk.CTkFrame(parent, height=10, fg_color="transparent").pack()
+        self._refresh_property_table()
+
     def _row_entry(self, parent, label, help_text):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=3)
@@ -1290,12 +1616,15 @@ class MainWindow(ctk.CTk):
             self.from_label.configure(text=canvas.nodes[t["from"]]["name"])
             self.to_label.configure(text=canvas.nodes[t["to"]]["name"])
             self.style_menu.set("曲线" if t.get("style") == "curve" else "直线")
-            is_auto = t.get("trigger") == "auto"
-            self.trigger_menu.set("自动转移" if is_auto else "事件转移")
-            self.event_entry.configure(
-                state="disabled" if is_auto else "normal")
-            self._set_entry(self.event_entry, "" if is_auto else t["event"])
-            self._set_entry(self.priority_entry, str(t.get("priority", 1)))
+            # 触发方式/优先级：极简版不渲染，未创建时不处理
+            if self.trigger_menu is not None:
+                is_auto = t.get("trigger") == "auto"
+                self.trigger_menu.set("自动转移" if is_auto else "事件转移")
+                self.event_entry.configure(
+                    state="disabled" if is_auto else "normal")
+                self._set_entry(self.event_entry, "" if is_auto else t["event"])
+            if self.priority_entry is not None:
+                self._set_entry(self.priority_entry, str(t.get("priority", 1)))
             self.trans_frame.pack(fill="x")
             self._update_guard_row()
             self._update_transition_action_row()
@@ -1330,13 +1659,16 @@ class MainWindow(ctk.CTk):
                     1 for x in canvas.transitions.values() if x["to"] == nid)))
                 self.out_label.configure(text=str(sum(
                     1 for x in canvas.transitions.values() if x["from"] == nid)))
-                pid = canvas.parent_of(nid)
-                self.parent_label.configure(
-                    text=canvas.nodes[pid]["name"]
-                    if pid in canvas.nodes else "—")
+                # 父状态：极简版不渲染，未创建时不处理
+                if self.parent_label is not None:
+                    pid = canvas.parent_of(nid)
+                    self.parent_label.configure(
+                        text=canvas.nodes[pid]["name"]
+                        if pid in canvas.nodes else "—")
                 self.state_frame.pack(fill="x")
                 self._update_state_action_box()
-                self._refresh_internal_rows(nid)
+                if self.internal_box is not None:
+                    self._refresh_internal_rows(nid)
                 return
 
         # 多选 / 空白：隐藏所有开关，恢复提示
@@ -1529,6 +1861,9 @@ class MainWindow(ctk.CTk):
 
     # ── 状态内部转移 ─────────────────────────────────────────
     def _refresh_internal_rows(self, nid):
+        # 极简版不渲染内部转移，直接跳过
+        if getattr(self, "internal_box", None) is None:
+            return
         items = self.canvas.nodes[nid].get("internal") or []
         if self._internal_nid != nid or len(self.internal_rows) != len(items):
             for row in self.internal_rows:
@@ -1824,10 +2159,11 @@ class MainWindow(ctk.CTk):
             return
         enabled = self.state_action_switch_var.get()
         if not enabled:
-            # 关闭：清空该状态的全部内部动作
+            # 关闭：清空当前模板里可见的动作（极简版只有执行，不动进入/退出数据）
             for box in self.state_action_entries.values():
                 box.clear()
-        self.canvas.set_state_actions_enabled(obj_id, enabled)
+        self.canvas.set_state_actions_enabled(
+            obj_id, enabled, kinds=list(self.state_action_entries.keys()))
         self._update_state_action_box()
         self.after(20, self._refresh_property_table)
 
@@ -2005,4 +2341,29 @@ class MainWindow(ctk.CTk):
             self._refresh_status_counts()
 
     def _on_generate(self):
-        self.status_label.configure(text="生成代码")
+        canvas = self.canvas
+        if canvas is None:
+            return
+        if self.level_var.get() != "极简版":
+            messagebox.showinfo(
+                "生成代码",
+                "极简版生成器已完成；完整版生成器尚未实现。\n请切换到「极简版」后重试。",
+                parent=self,
+            )
+            return
+        doc = self._active_doc()
+        project_name = doc["project_name"] if doc else "untitled"
+        result = generate_lite(canvas.export_state(), project_name)
+        if not result.ok:
+            messagebox.showerror(
+                "无法生成代码",
+                "请先修正以下问题：\n\n" +
+                "\n".join(f"· {item.message}" for item in result.errors),
+                parent=self,
+            )
+            self.status_label.configure(text="生成失败：存在阻断问题")
+            return
+        self.status_label.configure(
+            text=f"已生成 {len(result.files)} 个文件"
+                 + (f"，{len(result.warnings)} 条提醒" if result.warnings else ""))
+        CodePreview(self, result)
