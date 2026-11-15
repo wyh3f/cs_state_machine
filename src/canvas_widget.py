@@ -77,8 +77,8 @@ class StateCanvas(tk.Canvas):
         # 转移数据：{ trans_id: { "from", "to", "event", "line_id", "label_id" } }
         self.transitions = {}
 
-        # 当前实现版本：极简版不允许编辑复合状态（已有数据仍原样显示）
-        self.level = "极简版"
+        # 当前架构：FSM 不支持复合状态（已有数据仍原样显示）
+        self.arch = "FSM"
 
         # 选中状态（节点与转移都支持多选；selected_trans 为属性面板的主对象）
         self.selected_nodes = set()
@@ -210,26 +210,39 @@ class StateCanvas(tk.Canvas):
 
     # ── 示例数据 ────────────────────────────────────────────
     def demo_states(self):
-        """画几个示例状态和转移，让用户看到效果"""
+        """默认示例：单片机按键控制电机启停（极简版可直接生成）"""
         self._reset_canvas()
 
         demo_nodes = [
-            ("IDLE",    120, 180, True),   # 初始状态
-            ("RUNNING", 380, 120, False),
-            ("ERROR",   380, 260, False),
-            ("DONE",    640, 180, False),
+            ("IDLE",    140, 320, True,  False, None),
+            ("RUNNING", 540, 160, False, False, {"do": "run_tick++;"}),
+            ("ERROR",   540, 470, False, False, None),
+            ("DONE",    950, 320, False, True,  None),
         ]
         ids = {}
-        for name, x, y, is_initial in demo_nodes:
-            ids[name] = self._add_node(name, x, y, is_initial)
+        for name, x, y, is_initial, is_final, actions in demo_nodes:
+            ids[name] = self._add_node(
+                name, x, y, is_initial,
+                actions=actions, is_final=is_final,
+            )
 
         demo_trans = [
-            ("IDLE",    "RUNNING", "START"),
-            ("RUNNING", "ERROR",   "ERROR_OCC"),
-            ("RUNNING", "DONE",    "FINISH"),
+            ("IDLE",    "RUNNING", "START",  "start_btn",
+             "motor = 1; run_tick = 0;"),
+            # 同一状态内按优先级排列：故障优先，其次停止，最后正常完成
+            ("RUNNING", "ERROR",   "FAULT",  "overcurrent",
+             "motor = 0;"),
+            ("RUNNING", "IDLE",    "STOP",   "stop_btn",
+             "motor = 0;"),
+            ("RUNNING", "DONE",    "FINISH", "run_tick >= 100",
+             "motor = 0;"),
         ]
-        for fr, to, event in demo_trans:
-            self._add_transition(ids[fr], ids[to], event)
+        for fr, to, event, guard, action in demo_trans:
+            tid = self._add_transition(
+                ids[fr], ids[to], event, guard=guard, action=action)
+            # 标签上移，避免压住状态框文字
+            self.transitions[tid]["label_offset"] = [0, -55]
+            self._redraw_transition(tid)
 
         self._notify()
         self._notify_selection()
@@ -404,12 +417,12 @@ class StateCanvas(tk.Canvas):
         return [mid for mid, m in self.nodes.items()
                 if m.get("parent") == nid]
 
-    def set_level(self, level):
-        """同步当前实现版本；极简版关闭复合状态编辑"""
-        self.level = level if level in ("极简版", "完整版") else "极简版"
+    def set_arch(self, arch):
+        """同步当前架构；FSM 关闭复合状态编辑"""
+        self.arch = arch if arch in ("FSM", "HSM") else "FSM"
 
-    def _is_complete(self):
-        return self.level == "完整版"
+    def _allow_composite(self):
+        return self.arch == "HSM"
 
     def is_composite(self, nid):
         """有直接子状态即为复合状态"""
@@ -454,7 +467,7 @@ class StateCanvas(tk.Canvas):
 
     def set_parent(self, nid, parent_id):
         """设置或取消父状态（None 表示移出为顶层）"""
-        if not self._is_complete():
+        if not self._allow_composite():
             return False
         n = self.nodes.get(nid)
         if not n:
@@ -492,7 +505,7 @@ class StateCanvas(tk.Canvas):
 
     def _refresh_containment(self, nid):
         """拖动结束后按落点更新归属；多选时整组一起进入大状态框"""
-        if not self._is_complete():
+        if not self._allow_composite():
             return
         n = self.nodes.get(nid)
         if not n:
@@ -826,7 +839,7 @@ class StateCanvas(tk.Canvas):
 
     def select_children(self, nid):
         """选中复合状态内部的所有状态"""
-        if not self._is_complete():
+        if not self._allow_composite():
             return
         kids = set(self._descendants(nid))
         if not kids:
@@ -845,7 +858,7 @@ class StateCanvas(tk.Canvas):
 
     def wrap_selected(self, name=None):
         """把选中的状态包进一个新建的大状态框"""
-        if not self._is_complete():
+        if not self._allow_composite():
             return None
         nids = [nid for nid in self.selected_nodes if nid in self.nodes]
         nids = [nid for nid in nids
@@ -895,7 +908,7 @@ class StateCanvas(tk.Canvas):
 
     def remove_selected_from_parent(self):
         """把选中的状态一次性移出大状态框，摆到最外层状态右侧"""
-        if not self._is_complete():
+        if not self._allow_composite():
             return False
         nids = [nid for nid in self.selected_nodes
                 if nid in self.nodes and self.nodes[nid].get("parent")]
@@ -2324,7 +2337,7 @@ class StateCanvas(tk.Canvas):
             selection = set(self.selected_nodes)
             # 已有多个状态被选中时右键别处：保留多选，直接合成新的大状态框
             if ident not in selection and len(selection) >= 2:
-                if self._is_complete():
+                if self._allow_composite():
                     menu.add_command(
                         label=f"把选中的 {len(selection)} 个状态合成大状态框",
                         command=self.wrap_selected,
@@ -2357,19 +2370,19 @@ class StateCanvas(tk.Canvas):
                 )
             if any(self.nodes[nid].get("parent")
                    for nid in self.selected_nodes if nid in self.nodes) \
-                    and self._is_complete():
+                    and self._allow_composite():
                 label = ("移出父状态" if count == 1
                          else f"把选中的 {count} 个状态移出父状态")
                 menu.add_command(
                     label=label, command=self.remove_selected_from_parent,
                 )
-            if self._is_complete() and self.is_composite(ident):
+            if self._allow_composite() and self.is_composite(ident):
                 menu.add_command(
                     label="全选内部状态",
                     command=lambda: self.select_children(ident),
                 )
             # 用选中的状态新建一个大状态框（仅完整版）
-            if self._is_complete():
+            if self._allow_composite():
                 menu.add_command(
                     label=("新建大状态框" if count == 1
                            else f"把选中的 {count} 个状态合成大状态框"),
@@ -2401,7 +2414,7 @@ class StateCanvas(tk.Canvas):
             )
         else:
             # 空白处右键：可用当前多选新建大状态框（仅完整版），或新建状态
-            if len(self.selected_nodes) >= 2 and self._is_complete():
+            if len(self.selected_nodes) >= 2 and self._allow_composite():
                 menu.add_command(
                     label=(f"把选中的 {len(self.selected_nodes)} 个状态"
                            "合成大状态框"),
@@ -2442,7 +2455,7 @@ class StateCanvas(tk.Canvas):
             name = self._next_state_name()
         nid = self._add_node(name, x, y)
         # 拖到已有状态内部松手，直接成为它的子状态（仅完整版）
-        if self._is_complete():
+        if self._allow_composite():
             parent = self._containment_target(nid, x, y)
             if parent:
                 self.nodes[nid]["parent"] = parent

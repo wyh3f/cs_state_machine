@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from canvas_widget import StateCanvas
-from generator import generate_lite
+from generator import generate_lite, generate_full
 
 
 class HoverTooltip:
@@ -773,6 +773,9 @@ class MainWindow(ctk.CTk):
             return
         doc["arch"] = self.arch_var.get()
         doc["level"] = self.level_var.get()
+        # 画布同步架构：FSM 关闭复合状态编辑
+        if getattr(self, "canvas", None):
+            self.canvas.set_arch(doc["arch"])
         if not self._loading and (doc["arch"], doc["level"]) != (
                 self._last_style or (None, None)):
             self._mark_active_modified()
@@ -880,7 +883,7 @@ class MainWindow(ctk.CTk):
         self.doc_seq = 1
         self.canvas = None
         self._build_property_panel()
-        self._create_doc("未命名1", demo=True)
+        self._create_doc("motor_demo", demo=True)
 
     # ── 多画布文档 ───────────────────────────────────────────
     def _active_doc(self):
@@ -936,7 +939,7 @@ class MainWindow(ctk.CTk):
             if project.get("level") in ("极简版", "完整版") else "极简版",
             "modified": False, "tab": None, "btn": None, "close": None,
         }
-        canvas.set_level(doc["level"])
+        canvas.set_arch(doc["arch"])
         canvas.on_change = lambda c=canvas: self._on_doc_changed(c)
         canvas.on_select = lambda c=canvas: self._on_doc_select(c)
         canvas.on_zoom = lambda z, c=canvas: self._on_doc_zoom(c, z)
@@ -960,7 +963,7 @@ class MainWindow(ctk.CTk):
             other["canvas"].pack_forget()
         doc["canvas"].pack(fill="both", expand=True)
         self.canvas = doc["canvas"]
-        self.canvas.set_level(doc["level"])
+        self.canvas.set_arch(doc["arch"])
         self.project_path = doc["path"]
         self._modified = doc["modified"]
         self.palette.attach(self.canvas)
@@ -1055,9 +1058,6 @@ class MainWindow(ctk.CTk):
     def _apply_level_mode(self):
         """极简版/完整版切换：销毁右面板全部子控件，按新 level 用对应模板重建"""
         level = self.level_var.get()
-        # 画布同步版本：极简版关闭复合状态编辑
-        if getattr(self, "canvas", None):
-            self.canvas.set_level(level)
         # 重建前保存工程名（project_entry 是新建的，需要回填）
         doc = self._active_doc() if getattr(self, "docs", None) else None
         project_name = doc["project_name"] if doc else "untitled"
@@ -2349,16 +2349,13 @@ class MainWindow(ctk.CTk):
         canvas = self.canvas
         if canvas is None:
             return
-        if self.level_var.get() != "极简版":
-            messagebox.showinfo(
-                "生成代码",
-                "极简版生成器已完成；完整版生成器尚未实现。\n请切换到「极简版」后重试。",
-                parent=self,
-            )
-            return
         doc = self._active_doc()
         project_name = doc["project_name"] if doc else "untitled"
-        result = generate_lite(canvas.export_state(), project_name)
+        data = canvas.export_state()
+        if self.level_var.get() == "极简版":
+            result = generate_lite(data, project_name)
+        else:
+            result = generate_full(data, project_name)
         if not result.ok:
             messagebox.showerror(
                 "无法生成代码",

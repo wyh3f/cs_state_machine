@@ -1,7 +1,7 @@
-"""风格 1：极简 FSM（goto + 自研宏）
+"""风格 1：极简 FSM（单步推进）
 
-基于参考仓库 rdentato/fsm 的思路修改：保留 goto 结构与防 fall-through 语义，
-新增 fsm_begin(state) 以支持任意名称的初始状态。生成代码零依赖、可直接编译。
+每次调用只执行当前状态一次：跑执行动作、检查转移、切换后立即返回。
+生成代码不含任何循环，不会阻塞调用方。
 """
 
 from generator.base import (
@@ -9,60 +9,9 @@ from generator.base import (
     sanitize_identifier,
 )
 
-# 生成到目标工程的宏头文件；基于 MIT 许可的 rdentato/fsm 修改
-FSM_HEADER = """\
-/*
- * 极简 goto 状态机宏（自动生成，请勿手动修改）
- *
- * 基于 rdentato/fsm 修改（https://repo.dentato.com/fsm）：
- *   1. 新增 fsm_begin(state)，允许任意名称的初始状态（原版固定为 START）
- *   2. 保留原有的 goto 结构与防 fall-through 语义
- *
- * MIT License
- *
- * Copyright (c) 2025 Remo Dentato
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-#ifndef CSM_FSM_H
-#define CSM_FSM_H
-
-#define CSM_FSM_VERSION 0x00010000
-
-/* 进入状态机：跳到指定初始状态，同时定义退出标签 */
-#define fsm_begin(s)  if (1) { goto fsm_state_ ## s; fsm_exit: ; } else
-
-/* 定义一个状态；顺序流入、break 或 continue 都会退出整个状态机 */
-#define fsmstate(s)   for(;;) for(;;) if (1) goto fsm_exit; else fsm_state_ ## s:
-
-/* 跳转到另一个状态 */
-#define fsmgoto(s)    goto fsm_state_ ## s
-
-/* 退出状态机 */
-#define fsmexit       goto fsm_exit
-
-#endif /* CSM_FSM_H */
-"""
-
 
 def generate_lite(canvas_data, project_name):
-    """把画布数据生成为极简 FSM 的 C 代码；返回 GenerationResult"""
+    """把画布数据生成为单步推进的 C 代码；返回 GenerationResult"""
     result = GenerationResult()
     nodes = list(canvas_data.get("nodes") or [])
     trans = list(canvas_data.get("trans") or [])
@@ -78,14 +27,40 @@ def generate_lite(canvas_data, project_name):
         return result
 
     project = sanitize_identifier(project_name, fallback="fsm")
-    source = _render_source(project, nodes, trans, nodes_by_id, initials[0], result)
-    header = project + "_fsm.h"
     result.files = [
-        GeneratedFile(header, FSM_HEADER),
-        GeneratedFile(project + "_fsm.c", source),
+        GeneratedFile(project + "_fsm.h", _render_header(project)),
+        GeneratedFile(
+            project + "_fsm.c",
+            _render_source(project, nodes, trans, nodes_by_id, initials[0],
+                           result),
+        ),
     ]
     return result
 
+
+# ── 数据准备 ────────────────────────────────────────────────
+
+def _priority(t):
+    try:
+        return int(t.get("priority", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _guard(t):
+    return (t.get("guard") or "").strip() if t.get("guard_on") else ""
+
+
+def _action(t):
+    return (t.get("action") or "").strip() if t.get("action_on") else ""
+
+
+def _do_text(node):
+    actions = node.get("actions") or {}
+    return (actions.get("do") or "").strip() if node.get("actions_on") else ""
+
+
+# ── 校验 ────────────────────────────────────────────────────
 
 def _validate(nodes, trans, nodes_by_id, initials, result):
     if not initials:
@@ -104,134 +79,184 @@ def _validate(nodes, trans, nodes_by_id, initials, result):
             result.add_error(f"状态名「{name}」重复")
         seen[name] = n
         if n.get("parent"):
-            result.add_error(f"状态「{name}」属于复合状态，极简版不支持层级结构")
+            result.add_error(f"状态「{name}」属于复合状态，极简版不支持层级")
         if n.get("internal"):
             result.add_error(f"状态「{name}」存在内部转移，极简版不支持")
 
     for t in trans:
         if t.get("trigger") == "auto":
-            result.add_error("存在自动转移，极简版不支持（请在完整版中改为事件转移）")
+            result.add_error("存在自动转移，极简版不支持（请改用完整版）")
         if t.get("from") not in nodes_by_id or t.get("to") not in nodes_by_id:
             result.add_error("存在指向不存在状态的转移")
 
+    _check_warnings(nodes, trans, result)
+
+
+def _state_name(nodes, nid):
+    for n in nodes:
+        if n.get("id") == nid:
+            return n.get("name", "?")
+    return "?"
+
+
+def _check_warnings(nodes, trans, result):
+    targets = {t.get("to") for t in trans}
+    initial_ids = {n.get("id") for n in nodes if n.get("is_initial")}
+    for n in nodes:
+        if n.get("id") not in targets and n.get("id") not in initial_ids:
+            result.add_warning(f"状态「{n.get('name')}」没有入边，永远无法进入")
+
+    grouped = {}
+    for index, t in enumerate(trans):
+        grouped.setdefault(t.get("from"), []).append((index, t))
+    for nid, items in grouped.items():
+        items.sort(key=lambda pair: (_priority(pair[1]), pair[0]))
+        name = _state_name(nodes, nid)
+        for pos, (_, t) in enumerate(items):
+            if pos < len(items) - 1 and not _guard(t):
+                result.add_warning(
+                    f"状态「{name}」有无守卫转移，其后的转移不可达")
+                break
+
+    for n in nodes:
+        name = n.get("name")
+        if n.get("is_final"):
+            if any(t.get("from") == n.get("id") for t in trans):
+                result.add_warning(f"最终状态「{name}」的出边不会生效")
+            if _do_text(n):
+                result.add_warning(f"最终状态「{name}」的执行动作不会执行")
+        if n.get("actions_on"):
+            actions = n.get("actions") or {}
+            if (actions.get("entry") or "").strip():
+                result.add_warning(f"状态「{name}」的进入动作未生成（极简版不支持）")
+            if (actions.get("exit") or "").strip():
+                result.add_warning(f"状态「{name}」的退出动作未生成（极简版不支持）")
+        else:
+            actions = n.get("actions") or {}
+            if any((actions.get(k) or "").strip() for k in ("entry", "exit", "do")):
+                result.add_warning(f"状态「{name}」的动作未开启，内容不会生成")
+
+    for t in trans:
+        name = _state_name(nodes, t.get("from"))
+        if t.get("guard_on") is False and (t.get("guard") or "").strip():
+            result.add_warning(f"状态「{name}」有一条转移的守卫未开启，内容不会生成")
+        if t.get("action_on") is False and (t.get("action") or "").strip():
+            result.add_warning(f"状态「{name}」有一条转移的动作未开启，内容不会生成")
+
+
+# ── 头文件 ──────────────────────────────────────────────────
+
+def _render_header(project):
+    up = project.upper()
+    return "\n".join([
+        "/*",
+        " * 自动生成，请勿手动修改",
+        f" * 工程：{project}",
+        " * 生成器：极简版（单步推进）",
+        " */",
+        f"#ifndef {up}_FSM_H",
+        f"#define {up}_FSM_H",
+        "",
+        f"void {project}_run(void);",
+        "",
+        f"#endif /* {up}_FSM_H */",
+        "",
+    ])
+
+
+# ── 源文件 ──────────────────────────────────────────────────
 
 def _render_source(project, nodes, trans, nodes_by_id, initial, result):
-    # 每个状态挂上自己的出边，按优先级升序（同优先级保持创建顺序）
-    outgoing = {n.get("id"): [] for n in nodes}
+    up = project.upper()
+    grouped = {n.get("id"): [] for n in nodes}
     for index, t in enumerate(trans):
-        outgoing.setdefault(t.get("from"), []).append((index, t))
-    for items in outgoing.values():
+        grouped.setdefault(t.get("from"), []).append((index, t))
+    for items in grouped.values():
         items.sort(key=lambda pair: (_priority(pair[1]), pair[0]))
 
-    lines = []
-    lines.append("/*")
-    lines.append(" * 自动生成，请勿手动修改")
-    lines.append(f" * 工程：{project}")
-    lines.append(" * 生成器：极简版（goto 风格）")
-    lines.append(" */")
-    lines.append(f'#include "{project}_fsm.h"')
+    lines = [
+        "/*",
+        " * 自动生成，请勿手动修改",
+        f" * 工程：{project}",
+        " * 生成器：极简版（单步推进，无循环）",
+        " */",
+        f'#include "{project}_fsm.h"',
+        "",
+        "typedef enum {",
+    ]
+    for n in nodes:
+        lines.append(f"    {up}_ST_{n.get('name')},")
+    lines.append(f"}} {project}_state_t;")
     lines.append("")
+    lines.append(
+        f"static {project}_state_t {project}_state = "
+        f"{up}_ST_{initial.get('name')};")
+    lines.append("")
+
     lines.append(f"void {project}_run(void)")
     lines.append("{")
-    lines.append("    /* 用户变量可在此处声明，例如：static int count = 0; */")
-    lines.append(f"    fsm_begin({initial.get('name')}) {{")
+    lines.append(f"    switch ({project}_state) {{")
+    for n in nodes:
+        name = n.get("name")
+        lines.append(f"    case {up}_ST_{name}:")
+        lines.append(f"        goto st_{name};")
+    lines.append("    default:")
+    lines.append("        return;")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    return;")
+    lines.append("")
 
-    # 初始状态排第一，其余按画布创建顺序，便于阅读
-    ordered = [initial] + [n for n in nodes if n is not initial]
-    for node in ordered:
-        _render_state(lines, node, outgoing.get(node.get("id"), []),
+    for n in nodes:
+        _render_state(lines, project, up, n, grouped.get(n.get("id")) or [],
                       nodes_by_id, result)
 
-    lines.append("    }")
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
 
 
-def _render_state(lines, node, items, nodes_by_id, result):
+def _render_state(lines, project, up, node, items, nodes_by_id, result):
     name = node.get("name")
-    actions = node.get("actions") or {}
-    # 执行动作只有开关开启且内容非空时才生成
-    do_text = (actions.get("do") or "").strip() if node.get("actions_on") else ""
-    if not node.get("actions_on") and (actions.get("do") or "").strip():
-        result.add_warning(
-            f"状态「{name}」的执行动作未开启，内容不会生成")
+    lines.append(f"st_{name}:")
     if node.get("is_final"):
-        if items:
-            result.add_warning(f"最终状态「{name}」的出边已忽略")
-        if do_text:
-            result.add_warning(f"最终状态「{name}」的执行动作已忽略")
-        lines.append(f"        fsmstate({name}) {{            /* 最终状态 */")
-        lines.append("            fsmexit;")
-        lines.append("        }")
+        lines.append("    /* 最终状态：不再推进 */")
+        lines.append("    return;")
+        lines.append("")
+        return
+    do_text = _do_text(node)
+    if do_text:
+        lines.append("    /* 执行动作 */")
+        lines.append(indent_lines(do_text, "    "))
+    if not items:
+        lines.append("    /* 没有出边：保持当前状态 */")
+        lines.append("    return;")
         lines.append("")
         return
 
-    if node.get("actions_on") and (actions.get("entry") or "").strip():
-        result.add_warning(f"状态「{name}」的进入动作未生成（极简版不支持）")
-    if node.get("actions_on") and (actions.get("exit") or "").strip():
-        result.add_warning(f"状态「{name}」的退出动作未生成（极简版不支持）")
-
-    lines.append(f"        fsmstate({name}) {{")
-    if do_text:
-        if not items:
-            result.add_warning(
-                f"状态「{name}」有执行动作但没有出边，将在此永久循环")
-        lines.append("            for (;;) {")
-        lines.append(indent_lines(do_text, "                "))
-        _render_transitions(lines, name, items, nodes_by_id, result,
-                            "                ")
-        lines.append("            }")
-    else:
-        _render_transitions(lines, name, items, nodes_by_id, result,
-                            "            ")
-        if not items:
-            lines.append("            /* 没有出边：直接退出状态机 */")
-        lines.append("            fsmexit;")
-    lines.append("        }")
-    lines.append("")
-
-
-def _render_transitions(lines, state_name, items, nodes_by_id, result, pad):
-    for position, (_, t) in enumerate(items):
-        target = nodes_by_id[t.get("to")].get("name")
+    emitted = 0
+    for _, t in items:
         event = (t.get("event") or "").strip()
+        guard = " ".join(_guard(t).split())
+        action = _action(t)
+        target = nodes_by_id[t.get("to")].get("name")
         comment = f"  /* {event} */" if event else ""
-        guard = (t.get("guard") or "").strip() if t.get("guard_on") else ""
-        action = (t.get("action") or "").strip() if t.get("action_on") else ""
-
-        if t.get("guard_on") and not guard:
-            result.add_warning(f"状态「{state_name}」有一条转移开启了守卫但内容为空")
-        if t.get("action_on") and not action:
-            result.add_warning(f"状态「{state_name}」有一条转移开启了动作但内容为空")
-        if not t.get("action_on") and (t.get("action") or "").strip():
-            result.add_warning(
-                f"状态「{state_name}」有一条转移的动作未开启，内容不会生成")
-
-        if not guard:
-            if position < len(items) - 1:
-                result.add_warning(
-                    f"状态「{state_name}」的无守卫转移之后的转移不可达")
+        if guard:
+            lines.append(f"    if ({guard}) {{{comment}")
             if action:
-                lines.append(f"{pad}/* 无条件转移{comment} */")
-                lines.append(indent_lines(action, pad))
-                lines.append(f"{pad}fsmgoto({target});")
-            else:
-                lines.append(f"{pad}fsmgoto({target});{comment}")
-            return
-
-        single_guard = " ".join(guard.split())
-        if action:
-            lines.append(f"{pad}if ({single_guard}) {{{comment}")
-            lines.append(indent_lines(action, pad + "    "))
-            lines.append(f"{pad}    fsmgoto({target});")
-            lines.append(f"{pad}}}")
+                lines.append(indent_lines(action, "        "))
+            lines.append(f"        {project}_state = {up}_ST_{target};")
+            lines.append("        return;")
+            lines.append("    }")
+            emitted += 1
         else:
-            lines.append(f"{pad}if ({single_guard}) {{ fsmgoto({target}); }}{comment}")
-
-
-def _priority(t):
-    try:
-        return int(t.get("priority", 1))
-    except (TypeError, ValueError):
-        return 1
+            lines.append(f"    /* 无条件转移{comment} */")
+            if action:
+                lines.append(indent_lines(action, "    "))
+            lines.append(f"    {project}_state = {up}_ST_{target};")
+            lines.append("    return;")
+            emitted += 1
+            break
+    lines.append("    /* 没有转移成立：保持当前状态 */")
+    lines.append("    return;")
+    lines.append("")
