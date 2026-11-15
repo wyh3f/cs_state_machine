@@ -936,6 +936,7 @@ class MainWindow(ctk.CTk):
             if project.get("level") in ("极简版", "完整版") else "极简版",
             "modified": False, "tab": None, "btn": None, "close": None,
         }
+        canvas.set_level(doc["level"])
         canvas.on_change = lambda c=canvas: self._on_doc_changed(c)
         canvas.on_select = lambda c=canvas: self._on_doc_select(c)
         canvas.on_zoom = lambda z, c=canvas: self._on_doc_zoom(c, z)
@@ -959,6 +960,7 @@ class MainWindow(ctk.CTk):
             other["canvas"].pack_forget()
         doc["canvas"].pack(fill="both", expand=True)
         self.canvas = doc["canvas"]
+        self.canvas.set_level(doc["level"])
         self.project_path = doc["path"]
         self._modified = doc["modified"]
         self.palette.attach(self.canvas)
@@ -1053,6 +1055,9 @@ class MainWindow(ctk.CTk):
     def _apply_level_mode(self):
         """极简版/完整版切换：销毁右面板全部子控件，按新 level 用对应模板重建"""
         level = self.level_var.get()
+        # 画布同步版本：极简版关闭复合状态编辑
+        if getattr(self, "canvas", None):
+            self.canvas.set_level(level)
         # 重建前保存工程名（project_entry 是新建的，需要回填）
         doc = self._active_doc() if getattr(self, "docs", None) else None
         project_name = doc["project_name"] if doc else "untitled"
